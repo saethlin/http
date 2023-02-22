@@ -82,7 +82,10 @@ pub struct HeaderMap<T = HeaderValue> {
 /// more than once if it has more than one associated value.
 #[derive(Debug)]
 pub struct Iter<'a, T> {
-    inner: IterMut<'a, T>,
+    map: *const HeaderMap<T>,
+    entry: usize,
+    cursor: Option<Cursor>,
+    lt: PhantomData<&'a HeaderMap<T>>,
 }
 
 /// `HeaderMap` mutable entry iterator
@@ -801,12 +804,10 @@ impl<T> HeaderMap<T> {
     /// ```
     pub fn iter(&self) -> Iter<'_, T> {
         Iter {
-            inner: IterMut {
-                map: self as *const _ as *mut _,
-                entry: 0,
-                cursor: self.entries.first().map(|_| Cursor::Head),
-                lt: PhantomData,
-            },
+            map: self as *const _ as *mut _,
+            entry: 0,
+            cursor: self.entries.first().map(|_| Cursor::Head),
+            lt: PhantomData,
         }
     }
 
@@ -2064,17 +2065,58 @@ fn append_value<T>(
 
 // ===== impl Iter =====
 
+impl<'a, T> Iter<'a, T> {
+    fn next_unsafe(&mut self) -> Option<(&'a HeaderName, *const T)> {
+        use self::Cursor::*;
+
+        if self.cursor.is_none() {
+            if (self.entry + 1) >= unsafe { &*self.map }.entries.len() {
+                return None;
+            }
+
+            self.entry += 1;
+            self.cursor = Some(Cursor::Head);
+        }
+
+        let entry = unsafe { &(*self.map).entries[self.entry] };
+
+        match self.cursor.unwrap() {
+            Head => {
+                self.cursor = entry.links.map(|l| Values(l.next));
+                Some((&entry.key, &entry.value as *const _ ))
+            }
+            Values(idx) => {
+                let extra = unsafe { &(*self.map).extra_values[idx] };
+
+                match extra.next {
+                    Link::Entry(_) => self.cursor = None,
+                    Link::Extra(i) => self.cursor = Some(Values(i)),
+                }
+
+                Some((&entry.key, &extra.value as *const _ ))
+            }
+        }
+    }
+}
+
 impl<'a, T> Iterator for Iter<'a, T> {
     type Item = (&'a HeaderName, &'a T);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner
-            .next_unsafe()
+        self.next_unsafe()
             .map(|(key, ptr)| (key, unsafe { &*ptr }))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
+        let map = unsafe { &*self.map };
+        debug_assert!(map.entries.len() >= self.entry);
+
+        let lower = map.entries.len() - self.entry;
+        // We could pessimistically guess at the upper bound, saying
+        // that its lower + map.extra_values.len(). That could be
+        // way over though, such as if we're near the end, and have
+        // already gone through several extra values...
+        (lower, None)
     }
 }
 
@@ -2098,22 +2140,22 @@ impl<'a, T> IterMut<'a, T> {
             self.cursor = Some(Cursor::Head);
         }
 
-        let entry = unsafe { &(*self.map).entries[self.entry] };
+        let entry = unsafe { &mut (*self.map).entries[self.entry] };
 
         match self.cursor.unwrap() {
             Head => {
                 self.cursor = entry.links.map(|l| Values(l.next));
-                Some((&entry.key, &entry.value as *const _ as *mut _))
+                Some((&entry.key, &mut entry.value as *mut _))
             }
             Values(idx) => {
-                let extra = unsafe { &(*self.map).extra_values[idx] };
+                let extra = unsafe { &mut (*self.map).extra_values[idx] };
 
                 match extra.next {
                     Link::Entry(_) => self.cursor = None,
                     Link::Extra(i) => self.cursor = Some(Values(i)),
                 }
 
-                Some((&entry.key, &extra.value as *const _ as *mut _))
+                Some((&entry.key, &mut extra.value as *mut _))
             }
         }
     }
@@ -3493,4 +3535,14 @@ fn skip_duplicates_during_key_iteration() {
     map.append("a", HeaderValue::from_static("a"));
     map.append("a", HeaderValue::from_static("b"));
     assert_eq!(map.keys().count(), map.keys_len());
+}
+
+#[test]
+fn iter_mut() {
+    let mut map = HeaderMap::new();
+    map.append("a", HeaderValue::from_static("a"));
+    for x in map.iter_mut() {
+        *x.1 = HeaderValue::from_static("b");
+    }
+    assert_eq!(map["a"], HeaderValue::from_static("b"));
 }
